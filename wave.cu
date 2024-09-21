@@ -318,10 +318,11 @@ struct DoubleSlitSmallScale : public BaseSceneSmallScale {
 
     static __host__ __device__ __forceinline__ bool
     is_wall(int32_t idx_x, int32_t idx_y) {
+        constexpr float EPS = 1e-6;
         float y = float(idx_y) / (n_cells_y - 1);
         return (idx_x == (n_cells_x - 1) * 2 / 3) &&
-            !((y >= 0.45f - slit_width / 2 && y <= 0.45f + slit_width / 2) ||
-              (y >= 0.55f - slit_width / 2 && y <= 0.55f + slit_width / 2));
+            !((y >= 0.45f - slit_width / 2 - EPS && y <= 0.45f + slit_width / 2 + EPS) ||
+              (y >= 0.55f - slit_width / 2 - EPS && y <= 0.55f + slit_width / 2 + EPS));
     }
 
     static __host__ __device__ __forceinline__ bool
@@ -782,7 +783,7 @@ int main(int argc, char **argv) {
         }
         printf("  GPU shared memory implementation:\n");
         printf("    run time: %.2f ms\n", gpu_shmem_results.time_ms);
-        printf("    correctness: %.2e relative RMSE\n", naive_rel_rmse);
+        printf("    correctness: %.2e relative RMSE\n", shmem_rel_rmse);
         printf("\n");
 
         if (gpu_naive_correct) {
