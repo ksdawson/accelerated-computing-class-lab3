@@ -204,8 +204,8 @@ std::pair<float *, float *> wave_gpu_shmem(
 ////////////////////////////////////////////////////////////////////////////////
 
 struct BaseScene {
-    constexpr static int32_t n_cells_x = 1601;
-    constexpr static int32_t n_cells_y = 1601;
+    constexpr static int32_t n_cells_x = 3201;
+    constexpr static int32_t n_cells_y = 3201;
     constexpr static float c = 1.0f;
     constexpr static float dx = 1.0f / float(n_cells_x - 1);
     constexpr static float dy = 1.0f / float(n_cells_y - 1);
@@ -804,8 +804,17 @@ int main(int argc, char **argv) {
         printf("\n");
     }
 
+    // Run performance tests if requested.
+    bool run_perf_tests = false;
+    for (int i = 1; i < argc; ++i) {
+        if (strcmp(argv[i], "-p") == 0) {
+            run_perf_tests = true;
+            break;
+        }
+    }
+
     // Large scale tests: mainly for performance.
-    {
+    if (run_perf_tests) {
         printf("Large scale tests (on scene 'DoubleSlit'):\n");
         using Scene = DoubleSlit;
 
