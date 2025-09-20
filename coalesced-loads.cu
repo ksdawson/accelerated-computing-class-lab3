@@ -24,16 +24,30 @@ static constexpr size_t kNumOfInnerIterations = 3;
 // Non-Coalesced Memory Access Pattern
 
 __global__ void non_coalesced_load(data_type *dst, data_type *src, int x) {
-
-    // <!-- TODO: your code here -->
+    // Each thread gets a contiguous block of x elements
+    int thread_id = blockIdx.x * blockDim.x + threadIdx.x;
+    int start_block = thread_id * x;
+    // Thread loads x elements strided by 1
+    int start_index = start_block;
+    int end_index = start_index + x;
+    for (int i = start_index; i < end_index; ++i) {
+        dst[i] = src[i];
+    }
 }
 
 ////////////////////////////////////////////////////////////////////////////////
 // Coalesced Memory Access Pattern
 
 __global__ void coalesced_load(data_type *dst, data_type *src, int x) {
-
-    // <!-- TODO: your code here -->
+    // Each block gets a contiguous block of x * blockDim.x elements
+    int block_id = blockIdx.x;
+    int start_block = block_id* (x * blockDim.x);
+    // Thread loads x elements strided by blockDim.x
+    int start_index = start_block + threadIdx.x;
+    int end_index = start_index + x * blockDim.x;
+    for (int i = start_index; i < end_index; i += blockDim.x) {
+        dst[i] = src[i];
+    }
 }
 
 ////////////////////////////////////////////////////////////////////////////////
