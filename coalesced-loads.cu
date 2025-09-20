@@ -5,14 +5,20 @@
 // - Non-coalesced memory access pattern
 // - Coalesced memory access pattern
 
-#include <cuda_runtime.h>
+#include <algorithm>
+#include <chrono>
 #include <iostream>
+#include <stdlib.h>
+#include <vector>
 
 using data_type = float;
 
 #define THREADS_PER_WARP 32
-#define WARPS 32 // total threads = 32*32 = 1024
-#define X 1024   // elements per thread
+#define WARPS 128
+#define X 1024 // elements per thread
+
+static constexpr size_t kNumOfOuterIterations = 5;
+static constexpr size_t kNumOfInnerIterations = 3;
 
 ////////////////////////////////////////////////////////////////////////////////
 // Non-Coalesced Memory Access Pattern
@@ -46,20 +52,24 @@ __global__ void coalesced_load(data_type *dst, data_type *src, int x) {
         } \
     } while (0)
 
-// Macro to benchmark kernel and print timing results
-#define benchmark_and_run(kernel_name, time_var) \
+// BENCHPRESS macro for sophisticated benchmarking
+#define BENCHPRESS(kernel_name, kNumOfOuterIterations, kNumOfInnerIterations, ...) \
     do { \
-        cudaEvent_t start, stop; \
-        CUDA_CHECK(cudaEventCreate(&start)); \
-        CUDA_CHECK(cudaEventCreate(&stop)); \
-        CUDA_CHECK(cudaEventRecord(start)); \
-        kernel_name<<<WARPS, THREADS_PER_WARP>>>(d_dst, d_src, X); \
-        CUDA_CHECK(cudaEventRecord(stop)); \
-        CUDA_CHECK(cudaEventSynchronize(stop)); \
-        CUDA_CHECK(cudaEventElapsedTime(&time_var, start, stop)); \
-        std::cout << #kernel_name " time = \t" << time_var << " ms" << std::endl; \
-        CUDA_CHECK(cudaEventDestroy(start)); \
-        CUDA_CHECK(cudaEventDestroy(stop)); \
+        std::cout << "Running " << #kernel_name << " ...\n"; \
+        std::vector<double> times(kNumOfOuterIterations); \
+        for (size_t i = 0; i < kNumOfOuterIterations; ++i) { \
+            auto start = std::chrono::high_resolution_clock::now(); \
+            for (size_t j = 0; j < kNumOfInnerIterations; ++j) { \
+                kernel_name<<<WARPS, THREADS_PER_WARP>>>(__VA_ARGS__); \
+            } \
+            CUDA_CHECK(cudaDeviceSynchronize()); \
+            auto end = std::chrono::high_resolution_clock::now(); \
+            times[i] = std::chrono::duration_cast<std::chrono::nanoseconds>(end - start) \
+                           .count() / \
+                kNumOfInnerIterations; \
+        } \
+        std::sort(times.begin(), times.end()); \
+        std::cout << "  Runtime: " << times[0] / 1'000'000 << " ms" << std::endl; \
     } while (0)
 
 int main() {
@@ -67,8 +77,9 @@ int main() {
     int total_threads = THREADS_PER_WARP * WARPS;
     int total_elements = total_threads * X;
 
-    data_type *h_src = new data_type[total_elements];
-    data_type *h_dst = new data_type[total_elements];
+    data_type *h_src = (data_type *)malloc(sizeof(data_type) * total_elements);
+    data_type *h_dst = (data_type *)malloc(sizeof(data_type) * total_elements);
+
     for (int i = 0; i < total_elements; i++) {
         h_src[i] = static_cast<data_type>(i);
     }
@@ -83,17 +94,60 @@ int main() {
         total_elements * sizeof(data_type),
         cudaMemcpyHostToDevice));
 
-    // Run benchmarks
-    float ms_non, ms_co;
-    benchmark_and_run(non_coalesced_load, ms_non);
-    benchmark_and_run(coalesced_load, ms_co);
+    // Run benchmarks and test correctness
+    CUDA_CHECK(cudaMemset(d_dst, 0, total_elements * sizeof(data_type)));
+    BENCHPRESS(
+        non_coalesced_load,
+        kNumOfOuterIterations,
+        kNumOfInnerIterations,
+        d_dst,
+        d_src,
+        X);
 
-    // Print speedup comparison
-    std::cout << "Speedup: " << (ms_non / ms_co) << "x" << std::endl;
+    CUDA_CHECK(cudaMemcpy(
+        h_dst,
+        d_dst,
+        total_elements * sizeof(data_type),
+        cudaMemcpyDeviceToHost));
+
+    bool non_coalesced_correct = true;
+    for (int i = 0; i < total_elements; i++) {
+        if (h_dst[i] != h_src[i]) {
+            non_coalesced_correct = false;
+            break;
+        }
+    }
+    std::cout << "non_coalesced_load: " << (non_coalesced_correct ? "PASSED" : "FAILED")
+              << std::endl;
+
+    CUDA_CHECK(cudaMemset(d_dst, 0, total_elements * sizeof(data_type)));
+    BENCHPRESS(
+        coalesced_load,
+        kNumOfOuterIterations,
+        kNumOfInnerIterations,
+        d_dst,
+        d_src,
+        X);
+
+    CUDA_CHECK(cudaMemcpy(
+        h_dst,
+        d_dst,
+        total_elements * sizeof(data_type),
+        cudaMemcpyDeviceToHost));
+
+    bool coalesced_correct = true;
+    for (int i = 0; i < total_elements; i++) {
+        if (h_dst[i] != h_src[i]) {
+            coalesced_correct = false;
+            break;
+        }
+    }
+    std::cout << "coalesced_load: " << (coalesced_correct ? "PASSED" : "FAILED")
+              << std::endl;
 
     // Clean up memory
     CUDA_CHECK(cudaFree(d_src));
     CUDA_CHECK(cudaFree(d_dst));
-    delete[] h_src;
-    delete[] h_dst;
+    free(h_src);
+    free(h_dst);
 }
