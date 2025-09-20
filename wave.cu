@@ -98,6 +98,11 @@ std::pair<float *, float *> wave_cpu(float t0, int32_t n_steps, float *u0, float
 
 /// <--- your code here --->
 
+// Vector dimensions: 32x1, 16x2, 8x4, 4x8, 2x16, 1x32
+constexpr uint8_t VECTOR_SIZE = 32; // 32 wide GPU vector lanes
+constexpr uint8_t VECTOR_WIDTH = 32; // Tuning parameter
+constexpr uint8_t VECTOR_HEIGHT = VECTOR_SIZE / VECTOR_WIDTH;
+
 ////////////////////////////////////////////////////////////////////////////////
 // GPU Implementation (Naive)
 
@@ -119,7 +124,61 @@ __global__ void wave_gpu_naive_step(
     float *u0,      /* pointer to GPU memory */
     float const *u1 /* pointer to GPU memory */
 ) {
-    /* TODO: your GPU code here... */
+    // Scene parameters
+    constexpr int32_t n_cells_x = Scene::n_cells_x;
+    constexpr int32_t n_cells_y = Scene::n_cells_y;
+    constexpr float c = Scene::c;
+    constexpr float dx = Scene::dx;
+    constexpr float dt = Scene::dt;
+
+    // Dimensions needed for tiling
+    // uint32_t num_vectors_per_col = n_cells_x / VECTOR_HEIGHT;
+
+    // Thread info
+    int tot_threads = gridDim.x * blockDim.x;
+    int thread_index = blockIdx.x * blockDim.x + threadIdx.x;
+
+    // Flatten the 2D iteration space into 1D and stride tot_threads pixels each iteration
+    for (uint64_t idx = thread_index; idx < n_cells_y * n_cells_x; idx += tot_threads) {
+        // // Re-map the pixel index to tiles of vector height x vector width
+        // uint32_t tile_index = idx / VECTOR_SIZE;
+        // uint32_t tile_offset = idx % VECTOR_SIZE;
+        // // Order is y major
+        // uint32_t tile_j = tile_index / num_vectors_per_col;
+        // uint32_t tile_i = tile_index % num_vectors_per_col;
+
+        // // Calculate 2D pixel coordinates from the flattened tile index
+        // uint32_t vector_j = tile_offset / VECTOR_HEIGHT;
+        // uint32_t vector_i = tile_offset % VECTOR_HEIGHT;
+        // // Order is y major
+        // uint32_t idx_x = tile_i * VECTOR_HEIGHT + vector_i;
+        // uint32_t idx_y = tile_j * VECTOR_WIDTH + vector_j;
+
+        // Use 32x1 vectors
+        uint32_t idx_y = idx / n_cells_x;
+        uint32_t idx_x = idx % n_cells_x;
+
+        // Wave math
+        bool is_border =
+            (idx_x == 0 || idx_x == n_cells_x - 1 || idx_y == 0 ||
+                idx_y == n_cells_y - 1);
+        float u_next_val;
+        if (is_border || Scene::is_wall(idx_x, idx_y)) {
+            u_next_val = 0.0f;
+        } else if (Scene::is_source(idx_x, idx_y)) {
+            u_next_val = Scene::source_value(idx_x, idx_y, t);
+        } else {
+            constexpr float coeff = c * c * dt * dt / (dx * dx);
+            float damping = Scene::damping(idx_x, idx_y);
+            u_next_val =
+                ((2.0f - damping - 4.0f * coeff) * u1[idx] -
+                    (1.0f - damping) * u0[idx] +
+                    coeff *
+                        (u1[idx - 1] + u1[idx + 1] + u1[idx - n_cells_x] +
+                        u1[idx + n_cells_x]));
+        }
+        u0[idx] = u_next_val;
+    }
 }
 
 // 'wave_gpu_naive':
@@ -146,7 +205,11 @@ std::pair<float *, float *> wave_gpu_naive(
     float *u0, /* pointer to GPU memory */
     float *u1  /* pointer to GPU memory */
 ) {
-    /* TODO: your CPU code here... */
+    for (int32_t idx_step = 0; idx_step < n_steps; idx_step++) {
+        float t = t0 + idx_step * Scene::dt;
+        wave_gpu_naive_step<Scene><<<48, 4 * 32>>>(t, u0, u1);
+        std::swap(u0, u1);
+    }
     return {u0, u1};
 }
 
