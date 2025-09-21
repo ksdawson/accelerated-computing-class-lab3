@@ -202,8 +202,7 @@ std::pair<float *, float *> wave_gpu_naive(
 template <typename Scene>
 __global__ void wave_gpu_shmem_multistep(
     float t0, uint32_t ti_step, uint32_t tf_step, // Time params
-    float *u0, float *u1, // Buffer params
-    uint8_t ilp_size = 1 // Parallelization params
+    float *u0, float *u1 // Buffer params
 ) {
     // Setup the block SRAM
     // extern __shared__ float sram[];
@@ -218,46 +217,91 @@ __global__ void wave_gpu_shmem_multistep(
     // Thread info
     int tot_threads = gridDim.x * blockDim.x;
     int thread_index = blockIdx.x * blockDim.x + threadIdx.x;
+    
+    // Divide the grid into tiles (valid data that must be written back at the end)
+    uint32_t tile_height = n_cells_x / gridDim.x;
+    uint32_t tile_width = n_cells_y / gridDim.x;
+    uint32_t tiles_per_col = n_cells_x / tile_height;
+    uint32_t tiles_per_row = n_cells_y / tile_width;
+
+    // Tile location
+    int tile_index = blockIdx.x;
+    uint64_t tile_j = tile_index / tiles_per_col;
+    uint64_t tile_i = tile_index % tiles_per_col;
+
+    // Calculate starting global idx of the tile
+    uint32_t starting_global_idx = tile_j * n_cells_x + tile_i * tile_height;
+    uint32_t starting_global_idx_y = starting_global_idx / n_cells_x;
+    uint32_t starting_global_idx_x = starting_global_idx % n_cells_x;
+
+    // Calculate bounds of the tile
+    uint32_t left = starting_global_idx_y;
+    uint32_t right = left + tile_width;
+    uint32_t top = starting_global_idx_x;
+    uint32_t bottom = top + tile_height;
+
+    // Expand the tile by the number of time steps in each direction (overlap for invalid data)
+    uint32_t time_steps = tf_step - ti_step;
+    left = max(left - time_steps, 0);
+    right = min(right + time_steps, n_cells_y - 1);
+    top = max(top - time_steps, 0);
+    bottom = min(bottom + time_steps, n_cells_x - 1);
+
+    // Update the tile dimensions for the expanded tile
+    tile_height = bottom - top;
+    tile_width = right - left;
+
+    // Update the starting global idx of the tile
+    starting_global_idx = left * n_cells_x + top;
 
     // Iterate over the time steps
     for (uint32_t idx_step = ti_step; idx_step < tf_step; ++idx_step) {
         // Calculate t
         float t = t0 + idx_step * dt;
-        // Flatten the 2D iteration space into 1D and stride tot_threads pixels each iteration
-        for (uint64_t idx = thread_index * ilp_size; idx < n_cells_y * n_cells_x; idx += tot_threads * ilp_size) {
-            #pragma unroll
-            for (uint8_t i = 0; i < ilp_size; ++i) {
-                // Use 32x1 vectors
-                uint64_t ilp_idx = idx + i;
-                uint32_t idx_y = ilp_idx / n_cells_x;
-                uint32_t idx_x = ilp_idx % n_cells_x;
 
-                // Wave math
-                bool is_border =
-                    (idx_x == 0 || idx_x == n_cells_x - 1 || idx_y == 0 ||
-                        idx_y == n_cells_y - 1);
-                float u_next_val;
-                if (is_border || Scene::is_wall(idx_x, idx_y)) {
-                    u_next_val = 0.0f;
-                } else if (Scene::is_source(idx_x, idx_y)) {
-                    u_next_val = Scene::source_value(idx_x, idx_y, t);
-                } else {
-                    constexpr float coeff = c * c * dt * dt / (dx * dx);
-                    float damping = Scene::damping(idx_x, idx_y);
-                    u_next_val =
-                        ((2.0f - damping - 4.0f * coeff) * u1[ilp_idx] -
-                            (1.0f - damping) * u0[ilp_idx] +
-                            coeff *
-                                (u1[ilp_idx - 1] + u1[ilp_idx + 1] + u1[ilp_idx - n_cells_x] +
-                                u1[ilp_idx + n_cells_x]));
-                }
-                u0[ilp_idx] = u_next_val;
+        // Flatten the 2D iteration space into 1D and stride tot_threads pixels each iteration
+        for (uint64_t local_idx = thread_index; local_idx < tile_height * tile_width; local_idx += tot_threads) {
+            // Re-map local idx to global idx
+            uint64_t local_j = local_idx / tile_height;
+            uint64_t local_i = local_idx % tile_height;
+            uint64_t global_idx = starting_global_idx + local_j * n_cells_x + local_i;
+
+            // Uses 32x1 vectors
+            uint32_t idx_y = global_idx / n_cells_x;
+            uint32_t idx_x = global_idx % n_cells_x;
+
+            // Wave math
+            bool is_border =
+                (idx_x == 0 || idx_x == n_cells_x - 1 || idx_y == 0 ||
+                    idx_y == n_cells_y - 1);
+            float u_next_val;
+            if (is_border || Scene::is_wall(idx_x, idx_y)) {
+                u_next_val = 0.0f;
+            } else if (Scene::is_source(idx_x, idx_y)) {
+                u_next_val = Scene::source_value(idx_x, idx_y, t);
+            } else {
+                constexpr float coeff = c * c * dt * dt / (dx * dx);
+                float damping = Scene::damping(idx_x, idx_y);
+                u_next_val =
+                    ((2.0f - damping - 4.0f * coeff) * u1[global_idx] -
+                        (1.0f - damping) * u0[global_idx] +
+                        coeff *
+                            (u1[global_idx - 1] + u1[global_idx + 1] + u1[global_idx - n_cells_x] +
+                            u1[global_idx + n_cells_x]));
             }
+            u0[global_idx] = u_next_val;
         }
-        // We need the new pixel for all pixels before processing the next time step
+
+        // We need the new pixel for all pixels in the block before processing the next time step
         __syncthreads();
+
         // u0 contains the most recent timestamp and u1 contains the second most recent so swap
         std::swap(u0, u1);
+
+        // Shrink the tile
+        tile_height -= 2;
+        tile_width -= 2;
+        starting_global_idx += n_cells_x + 1; // Go over a col and down a row
     }
 }
 
@@ -295,8 +339,8 @@ std::pair<float *, float *> wave_gpu_shmem(
     float *extra1  /* pointer to GPU memory */
 ) {
     // Number of time steps to process at once in a kernel
-    uint8_t time_steps = 2;
-    
+    uint8_t time_steps = 1;
+
     for (uint32_t idx_step = 0; idx_step < n_steps; idx_step += time_steps) {
         // Compute starting and ending time step
         uint32_t ti_step = idx_step;
@@ -309,7 +353,7 @@ std::pair<float *, float *> wave_gpu_shmem(
         //     shmem_size_bytes
         // ));
         // Launch our kernel
-        // wave_gpu_shmem_multistep<Scene><<<48, 32 * 32, shmem_size_bytes>>>(ti, tf, u0, u1);
+        // wave_gpu_shmem_multistep<Scene><<<48, 32 * 32, shmem_size_bytes>>>(t0, ti_step, tf_step, u0, u1);
         wave_gpu_shmem_multistep<Scene><<<48, 32 * 32>>>(t0, ti_step, tf_step, u0, u1);
     }
     return {u0, u1};
