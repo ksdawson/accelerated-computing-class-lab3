@@ -237,28 +237,17 @@ __global__ void wave_gpu_shmem_multistep(
     tile_width += (tile_j == tiles_per_row - 1) ? extra_cols : 0;
     tile_height += (tile_i == tiles_per_col - 1) ? extra_rows : 0;
 
-    // Calculate bounds of the tile
-    uint32_t left = global_idx_y;
-    uint32_t right = left + tile_width;
-    uint32_t top = global_idx_x;
-    uint32_t bottom = top + tile_height;
-
     // Expand the tile by the number of time steps in each direction (overlap for invalid data)
     uint8_t time_steps = tf_step - ti_step;
-    uint8_t time_step_shrink = time_steps - 1; // time_step->shrink: 2->1, 3->2, 4->3, etc
-    left = max(left - time_step_shrink, 0);
-    right = min(right + time_step_shrink, n_cells_y);
-    top = max(top - time_step_shrink, 0);
-    bottom = min(bottom + time_step_shrink, n_cells_x);
-
-    // Update the tile dimensions for the expanded tile
-    tile_height = bottom - top;
-    tile_width = right - left;
+    uint8_t tile_expansion = time_steps - 1; // 1 time step shouldn't expand
+    // Edges can only expand in one dir
+    tile_width += (tile_j == 0 || tile_j == tiles_per_row - 1) ? tile_expansion : 2 * tile_expansion;
+    tile_height += (tile_i == 0 || tile_i == tiles_per_col - 1) ? tile_expansion : 2 * tile_expansion;
 
     // Debugging
     // if (threadIdx.x == 0) {
         // printf("n_cells_y: %u, n_cells_x: %u\n", n_cells_y, n_cells_x);
-        // printf("tile_index: %d, tile_height: %u, tile_width: %u, tile_size: %u\n", blockIdx.x, tile_height, tile_width, tile_height*tile_width);
+        // printf("tile_index: %d, tile_j: %u, tile_i: %u, tile_height: %u, tile_width: %u, tile_size: %u, tpc: %u, tpr: %u\n", blockIdx.x, tile_j, tile_i, tile_height, tile_width, tile_height*tile_width, tiles_per_col, tiles_per_row);
         // printf("tile_index: %d, tile_j: %llu, tile_i: %llu\n", blockIdx.x, tile_j, tile_i);
         // printf("starting_global_idx: %u, global_idx_y: %u, global_idx_x: %u\n", starting_global_idx, global_idx_y, global_idx_x);
         // printf("left: %d, right: %d, top: %d, bottom: %d\n", left, right, top, bottom);
@@ -308,11 +297,18 @@ __global__ void wave_gpu_shmem_multistep(
         std::swap(u0, u1); // Only swaps pointers in local registers
 
         // Shrink the tile
-        tile_height -= 2;
-        tile_width -= 2;
-        // Go over a col and down a row
-        ++global_idx_y;
-        ++global_idx_x;
+        if (tile_j == 0 || tile_j == tiles_per_row - 1) {
+            tile_width -=1;
+        } else {
+            tile_width -= 2;
+            ++global_idx_y; // Go over a col
+        }
+        if (tile_i == 0 || tile_i == tiles_per_col - 1) {
+            tile_height -= 1;
+        } else {
+            tile_height -= 2;
+            ++global_idx_x; // Go down a row
+        }
     }
 }
 
