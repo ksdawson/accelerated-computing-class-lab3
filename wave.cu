@@ -101,6 +101,40 @@ std::pair<float *, float *> wave_cpu(float t0, int32_t n_steps, float *u0, float
 ////////////////////////////////////////////////////////////////////////////////
 // GPU Implementation (Naive)
 
+// Helper to do wave math
+template <typename Scene>
+__device__ void wave(uint32_t idx_y, uint32_t idx_x, float t, // Scene params
+    float *u0, float *u1, uint64_t memory_idx, uint32_t memory_height // Memory params
+) {
+    // Scene parameters
+    constexpr int32_t n_cells_x = Scene::n_cells_x;
+    constexpr int32_t n_cells_y = Scene::n_cells_y;
+    constexpr float c = Scene::c;
+    constexpr float dx = Scene::dx;
+    constexpr float dt = Scene::dt;
+
+    // Wave math
+    bool is_border =
+        (idx_x == 0 || idx_x == n_cells_x - 1 || idx_y == 0 ||
+            idx_y == n_cells_y - 1);
+    float u_next_val;
+    if (is_border || Scene::is_wall(idx_x, idx_y)) {
+        u_next_val = 0.0f;
+    } else if (Scene::is_source(idx_x, idx_y)) {
+        u_next_val = Scene::source_value(idx_x, idx_y, t);
+    } else {
+        constexpr float coeff = c * c * dt * dt / (dx * dx);
+        float damping = Scene::damping(idx_x, idx_y);
+        u_next_val =
+            ((2.0f - damping - 4.0f * coeff) * u1[memory_idx] -
+                (1.0f - damping) * u0[memory_idx] +
+                coeff *
+                    (u1[memory_idx - 1] + u1[memory_idx + 1] + u1[memory_idx - memory_height] +
+                    u1[memory_idx + memory_height]));
+    }
+    u0[memory_idx] = u_next_val;
+}
+
 // 'wave_gpu_step':
 //
 // Input:
@@ -116,16 +150,13 @@ std::pair<float *, float *> wave_cpu(float t0, int32_t n_steps, float *u0, float
 template <typename Scene>
 __global__ void wave_gpu_naive_step(
     float t,
-    float *u0,      /* pointer to GPU memory */
-    float const *u1, /* pointer to GPU memory */
+    float *u0, /* pointer to GPU memory */
+    float *u1, /* pointer to GPU memory */
     uint8_t ilp_size = 1
 ) {
     // Scene parameters
     constexpr int32_t n_cells_x = Scene::n_cells_x;
     constexpr int32_t n_cells_y = Scene::n_cells_y;
-    constexpr float c = Scene::c;
-    constexpr float dx = Scene::dx;
-    constexpr float dt = Scene::dt;
 
     // Thread info
     int tot_threads = gridDim.x * blockDim.x;
@@ -139,27 +170,10 @@ __global__ void wave_gpu_naive_step(
             uint64_t ilp_idx = idx + i;
             uint32_t idx_y = ilp_idx / n_cells_x;
             uint32_t idx_x = ilp_idx % n_cells_x;
-
             // Wave math
-            bool is_border =
-                (idx_x == 0 || idx_x == n_cells_x - 1 || idx_y == 0 ||
-                    idx_y == n_cells_y - 1);
-            float u_next_val;
-            if (is_border || Scene::is_wall(idx_x, idx_y)) {
-                u_next_val = 0.0f;
-            } else if (Scene::is_source(idx_x, idx_y)) {
-                u_next_val = Scene::source_value(idx_x, idx_y, t);
-            } else {
-                constexpr float coeff = c * c * dt * dt / (dx * dx);
-                float damping = Scene::damping(idx_x, idx_y);
-                u_next_val =
-                    ((2.0f - damping - 4.0f * coeff) * u1[ilp_idx] -
-                        (1.0f - damping) * u0[ilp_idx] +
-                        coeff *
-                            (u1[ilp_idx - 1] + u1[ilp_idx + 1] + u1[ilp_idx - n_cells_x] +
-                            u1[ilp_idx + n_cells_x]));
-            }
-            u0[ilp_idx] = u_next_val;
+            wave<Scene>(idx_y, idx_x, t,
+                u0, u1, ilp_idx, n_cells_x
+            );
         }
     }
 }
@@ -199,57 +213,62 @@ std::pair<float *, float *> wave_gpu_naive(
 ////////////////////////////////////////////////////////////////////////////////
 // GPU Implementation (With Shared Memory)
 
+// Tuning parameters
+constexpr uint8_t TILES_PER_COL = 8; // We want as square as possible tiles?
+constexpr uint8_t TIME_STEPS = 8; // Number of time steps to process at once in a kernel
+
 // Helpers to load/store data
+__device__ void copy_mem(
+    float *src_u0, float *src_u1, uint32_t src_buffer_height,
+    float *dst_u0, float *dst_u1, uint32_t dst_buffer_height,
+    uint32_t local_height, uint32_t local_width
+) {
+    // Copy data from one buffer to another
+    for (uint64_t local_idx = threadIdx.x; local_idx < local_height * local_width; local_idx += blockDim.x) {
+        // Get local idx for local offset
+        uint32_t local_idx_y = local_idx / local_height;
+        uint32_t local_idx_x = local_idx % local_height;
+        // Get src idx
+        uint32_t src_idx = local_idx_y * src_buffer_height + local_idx_x;
+        // Get dst idx
+        uint32_t dst_idx = local_idx_y * dst_buffer_height + local_idx_x;
+        // Copy memory over
+        dst_u0[dst_idx] = src_u0[src_idx];
+        dst_u1[dst_idx] = src_u1[src_idx];
+    }
+    // Wait for all the memory to be copied
+    __syncthreads();
+}
 __device__ void load_shmem(
     float *global_u0, float *global_u1, uint32_t global_buffer_height, // Main memory buffer params
     float *local_u0, float *local_u1, uint32_t local_buffer_height, // SRAM buffer params
     uint32_t tile_height, uint32_t tile_width // Tile params
 ) {
-    // Load data from main memory
-    for (uint64_t tile_idx = threadIdx.x; tile_idx < tile_height * tile_width; tile_idx += blockDim.x) {
-        // Get tile idx for tile offset
-        uint32_t tile_idx_y = tile_idx / tile_height;
-        uint32_t tile_idx_x = tile_idx % tile_height;
-        // Get global idx
-        uint32_t global_idx = tile_idx_y * global_buffer_height + tile_idx_x;
-        // Get local idx
-        uint32_t local_idx = tile_idx_y * local_buffer_height + tile_idx_x;
-        // Copy memory over
-        local_u0[local_idx] = global_u0[global_idx];
-        local_u1[local_idx] = global_u1[global_idx];
-    }
-    // Wait for all the memory to be loaded
-    __syncthreads();
+    // Load data from main memory to SRAM
+    copy_mem(global_u0, global_u1, global_buffer_height,
+        local_u0, local_u1, local_buffer_height,
+        tile_height, tile_width
+    );
 }
 __device__ void store_shmem(
     float *global_u0, float *global_u1, uint32_t global_buffer_height, // Main memory buffer params
     float *local_u0, float *local_u1, uint32_t local_buffer_height, // SRAM buffer params
     uint32_t tile_height, uint32_t tile_width // Tile params
 ) {
-    // Store data to main memory
-    for (uint64_t tile_idx = threadIdx.x; tile_idx < tile_height * tile_width; tile_idx += blockDim.x) {
-        // Get tile idx for tile offset
-        uint32_t tile_idx_y = tile_idx / tile_height;
-        uint32_t tile_idx_x = tile_idx % tile_height;
-        // Get global idx
-        uint32_t global_idx = tile_idx_y * global_buffer_height + tile_idx_x;
-        // Get local idx
-        uint32_t local_idx = tile_idx_y * local_buffer_height + tile_idx_x;
-        // Copy memory over
-        global_u0[global_idx] = local_u0[local_idx];
-        global_u1[global_idx] = local_u1[local_idx];
-    }
-    // Wait for all the memory to be stored
-    __syncthreads();
+    // Store data to main memory from SRAM
+    copy_mem(local_u0, local_u1, local_buffer_height,
+        global_u0, global_u1, global_buffer_height,
+        tile_height, tile_width
+    );
 }
 
-// Helper to setup the SM tile
+// Helper to setup the tile
 __device__ void setup_tile(uint32_t scene_height, uint32_t scene_width, uint8_t tile_buffer, // Input
     uint32_t *out_tile_height, uint32_t *out_tile_width, uint32_t *out_scene_idx, // Output
     uint8_t *height_shrink_amt, uint8_t *width_shrink_amt, uint8_t *idx_y_shrink_amt, uint8_t *idx_x_shrink_amt // Output
 ) {
     // Tile dimensions
-    uint8_t tiles_per_col = 8; // Tuning parameter: We want as square as possible tiles?
+    uint8_t tiles_per_col = TILES_PER_COL;
     uint8_t tiles_per_row = gridDim.x / tiles_per_col;
 
     // Tile coordinates
@@ -291,40 +310,6 @@ __device__ void setup_tile(uint32_t scene_height, uint32_t scene_width, uint8_t 
     *out_tile_height = tile_height;
     *out_tile_width = tile_width;
     *out_scene_idx = scene_idx;
-}
-
-template <typename Scene>
-__device__ void wave(uint32_t idx_y, uint32_t idx_x, float t, // Scene params
-    float *u0, float *u1, // Buffer params
-    uint32_t memory_idx, uint32_t memory_height // Memory params
-) {
-    // Scene parameters
-    constexpr int32_t n_cells_x = Scene::n_cells_x;
-    constexpr int32_t n_cells_y = Scene::n_cells_y;
-    constexpr float c = Scene::c;
-    constexpr float dx = Scene::dx;
-    constexpr float dt = Scene::dt;
-
-    // Wave math
-    bool is_border =
-        (idx_x == 0 || idx_x == n_cells_x - 1 || idx_y == 0 ||
-            idx_y == n_cells_y - 1);
-    float u_next_val;
-    if (is_border || Scene::is_wall(idx_x, idx_y)) {
-        u_next_val = 0.0f;
-    } else if (Scene::is_source(idx_x, idx_y)) {
-        u_next_val = Scene::source_value(idx_x, idx_y, t);
-    } else {
-        constexpr float coeff = c * c * dt * dt / (dx * dx);
-        float damping = Scene::damping(idx_x, idx_y);
-        u_next_val =
-            ((2.0f - damping - 4.0f * coeff) * u1[memory_idx] -
-                (1.0f - damping) * u0[memory_idx] +
-                coeff *
-                    (u1[memory_idx - 1] + u1[memory_idx + 1] + u1[memory_idx - memory_height] +
-                    u1[memory_idx + memory_height]));
-    }
-    u0[memory_idx] = u_next_val;
 }
 
 template <typename Scene>
@@ -449,7 +434,7 @@ std::pair<float *, float *> wave_gpu_shmem(
     float *extra1  /* pointer to GPU memory */
 ) {
     // Number of time steps to process at once in a kernel
-    uint8_t time_steps = 8; // Tuning parameter
+    uint8_t time_steps = TIME_STEPS;
 
     for (uint32_t idx_step = 0; idx_step < n_steps; idx_step += time_steps) {
         // Compute starting and ending time step
