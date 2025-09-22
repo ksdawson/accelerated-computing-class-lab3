@@ -449,7 +449,7 @@ std::pair<float *, float *> wave_gpu_shmem(
     float *extra1  /* pointer to GPU memory */
 ) {
     // Number of time steps to process at once in a kernel
-    uint8_t time_steps = 1;
+    uint8_t time_steps = 8; // Tuning parameter
 
     for (uint32_t idx_step = 0; idx_step < n_steps; idx_step += time_steps) {
         // Compute starting and ending time step
