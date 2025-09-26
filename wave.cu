@@ -235,6 +235,21 @@ __device__ void copy_mem(
     // Wait for all the memory to be copied
     __syncthreads();
 }
+__device__ void warmup_cache(
+    float *src_u0, float *src_u1, uint32_t src_buffer_height,
+    uint32_t local_height, uint32_t local_width
+) {
+    for (uint32_t local_idx = threadIdx.x; local_idx < local_height * local_width; local_idx += blockDim.x) {
+        // Get local idx for local offset
+        uint32_t local_idx_y = local_idx / local_height;
+        uint32_t local_idx_x = local_idx % local_height;
+        // Get src idx
+        uint32_t src_idx = local_idx_y * src_buffer_height + local_idx_x;
+        // Preftech from main memory to L2 cache
+        asm volatile("prefetch.global.L2 [%0];" :: "l"(src_u0 + src_idx));
+        asm volatile("prefetch.global.L2 [%0];" :: "l"(src_u1 + src_idx));
+    }
+}
 
 // Helper to shrink along one dimension
 __device__ void shrink_axis(uint32_t &tile_size, uint8_t &front_shrink, uint8_t &back_shrink, // Tile params
@@ -320,6 +335,19 @@ __global__ void wave_gpu_shmem_multistep(
             local_u0, local_u1, local_buffer_height,
             tile_height, tile_width
         );
+        // Prefetch the next tile by bringing it into the L2 cache
+        uint32_t next_tile_idx = tile_idx + gridDim.x;
+        if (next_tile_idx < tiles_per_col * tiles_per_row) {
+            uint32_t next_tile_idx_y = next_tile_idx / tiles_per_col;
+            uint32_t next_tile_idx_x = next_tile_idx % tiles_per_col;
+            uint32_t next_scene_idx_y = next_tile_idx_y * base_tile_width;
+            uint32_t next_scene_idx_x = next_tile_idx_x * base_tile_height;
+            uint32_t next_scene_idx = next_scene_idx_y * Scene::n_cells_x + next_scene_idx_x;
+            warmup_cache(
+                u0 + next_scene_idx, u1 + next_scene_idx, global_buffer_height,
+                base_tile_height, base_tile_width
+            );
+        }
 
         // Limit steps so we don’t exceed shrink
         uint8_t max_padding = max(
