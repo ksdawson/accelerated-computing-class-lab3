@@ -213,7 +213,7 @@ std::pair<float *, float *> wave_gpu_naive(
 ////////////////////////////////////////////////////////////////////////////////
 // GPU Implementation (With Shared Memory)
 
-// Helpers to load/store data
+// Helper to load/store data
 __device__ void copy_mem(
     float *src_u0, float *src_u1, uint32_t src_buffer_height,
     float *dst_u0, float *dst_u1, uint32_t dst_buffer_height,
@@ -234,55 +234,6 @@ __device__ void copy_mem(
     }
     // Wait for all the memory to be copied
     __syncthreads();
-}
-
-// Helper to setup the tile
-__device__ void setup_tile(uint32_t scene_height, uint32_t scene_width, uint8_t tile_padding, // Input
-    uint32_t tiles_per_col, uint32_t tiles_per_row, uint32_t tile_j, uint32_t tile_i,
-    uint32_t *out_tile_height, uint32_t *out_tile_width, uint32_t *out_scene_idx, // Output
-    uint8_t *left_shrink_amt, uint8_t *right_shrink_amt, uint8_t *top_shrink_amt, uint8_t *bottom_shrink_amt // Output
-) {
-    // Divide the scene into tiles (valid data that must be written back at the end)
-    uint32_t tile_height = scene_height / tiles_per_col;
-    uint32_t tile_width = scene_width / tiles_per_row;
-
-    // Calculate starting scene idx of the tile
-    uint32_t scene_idx_y = tile_j * tile_width;
-    uint32_t scene_idx_x = tile_i * tile_height;
-
-    // Handle grids not divisible by the number of SMs
-    uint8_t extra_rows = scene_height % tiles_per_col;
-    uint8_t extra_cols = scene_width % tiles_per_row;
-    // Assign the extra to the edges since they have smaller overlap (limit to last for simplicity)
-    tile_width += (tile_j == tiles_per_row - 1) ? extra_cols : 0;
-    tile_height += (tile_i == tiles_per_col - 1) ? extra_rows : 0;
-
-    // You can only expand to the edges
-    uint8_t tile_padding_left = min(scene_idx_y, tile_padding);
-    uint8_t tile_padding_right = min(scene_width - (scene_idx_y + tile_width), tile_padding);
-    uint8_t tile_padding_top = min(scene_idx_x, tile_padding);
-    uint8_t tile_padding_bottom = min(scene_height - (scene_idx_x + tile_height), tile_padding);
-
-    // Expand the tile by the number of time steps in each direction (overlap for invalid data)
-    tile_width += tile_padding_left + tile_padding_right;
-    tile_height += tile_padding_top + tile_padding_bottom;
-
-    // Update the scene idx based on the expansion
-    scene_idx_y -= tile_padding_left;
-    scene_idx_x -= tile_padding_top;
-    uint32_t scene_idx = scene_idx_y * scene_height + scene_idx_x;
-
-    // Set the tile
-    *out_tile_height = tile_height;
-    *out_tile_width = tile_width;
-    *out_scene_idx = scene_idx;
-
-    // Set the shrink amts (edges can only shrink in one dir)
-    // If your expansion hit an edge, then you should only shrink when the opposite shrinks are equal to ensure you shrink to the correct size
-    *left_shrink_amt = tile_padding_left;
-    *right_shrink_amt = tile_padding_right;
-    *top_shrink_amt = tile_padding_top;
-    *bottom_shrink_amt = tile_padding_bottom;
 }
 
 // Helper to shrink along one dimension
@@ -315,38 +266,50 @@ template <typename Scene>
 __global__ void wave_gpu_shmem_multistep(
     float t0, uint32_t ti_step, uint32_t tf_step, // Time params
     float *u0, float *u1, float *extra0, float *extra1, // Buffer params
-    uint32_t subtiles_per_col, uint32_t subtiles_per_row // Loop tiling params
+    uint32_t tiles_per_col, uint32_t tiles_per_row // Loop tiling params
 ) {
     // Setup the block's SRAM
     extern __shared__ float sram[];
+    // Global buffer size
+    uint32_t global_buffer_height = Scene::n_cells_x;
 
-    // Iterate over the SM's subtiles and process each one one at a time
-    for (uint32_t subtile_idx = blockIdx.x; subtile_idx < subtiles_per_col * subtiles_per_row; subtile_idx += gridDim.x) {
-        // Get subtile idx
-        uint32_t subtile_idx_y = subtile_idx / subtiles_per_col;
-        uint32_t subtile_idx_x = subtile_idx % subtiles_per_col;
+    // Divide the scene into tiles (valid data that must be written back at the end)
+    uint32_t base_tile_height = Scene::n_cells_x / tiles_per_col;
+    uint32_t base_tile_width = Scene::n_cells_y / tiles_per_row;
+    // Handle scenes not divisible by the number of tiles
+    uint32_t extra_tile_height = base_tile_height + Scene::n_cells_x % tiles_per_col;
+    uint32_t extra_tile_width = base_tile_width + Scene::n_cells_y % tiles_per_row;
 
-        // Global buffers
-        float *global_u0 = u0;
-        float *global_u1 = u1;
-        uint32_t global_buffer_height = Scene::n_cells_x;
+    // Iterate over the SM's tiles and process each one one at a time
+    for (uint32_t tile_idx = blockIdx.x; tile_idx < tiles_per_col * tiles_per_row; tile_idx += gridDim.x) {
+        // Get tile idx
+        uint32_t tile_idx_y = tile_idx / tiles_per_col;
+        uint32_t tile_idx_x = tile_idx % tiles_per_col;
+        // Calculate starting scene idx of the tile
+        uint32_t scene_idx_y = tile_idx_y * base_tile_width;
+        uint32_t scene_idx_x = tile_idx_x * base_tile_height;
 
-        // Tile dimensions
-        uint32_t tile_height, tile_width;
-        // Shrink parameters
-        uint8_t left_shrink_amt, right_shrink_amt, top_shrink_amt, bottom_shrink_amt;
-        // Setup the tile
-        uint8_t tile_padding = tf_step - ti_step; // Expand by the number of time steps
-        uint32_t scene_idx;
-        setup_tile(Scene::n_cells_x, Scene::n_cells_y, tile_padding,
-            subtiles_per_col, subtiles_per_row, subtile_idx_y, subtile_idx_x,
-            &tile_height, &tile_width, &scene_idx,
-            &left_shrink_amt, &right_shrink_amt, &top_shrink_amt, &bottom_shrink_amt
-        );
-        // Move global buffers to tile location
-        global_u0 += scene_idx;
-        global_u1 += scene_idx;
+        // Tile size without time step expansion (add extra to edges for simplicity)
+        uint32_t tile_height = (tile_idx_x == tiles_per_col - 1) ? extra_tile_height : base_tile_height;
+        uint32_t tile_width = (tile_idx_y == tiles_per_row - 1) ? extra_tile_width : base_tile_width;
+        // Expand the tile by the number of time steps in each direction (overlap for invalid data)
+        uint8_t tile_padding = tf_step - ti_step;
+        // Cap expansion to the edges
+        uint8_t tile_padding_left = min(scene_idx_y, tile_padding);
+        uint8_t tile_padding_right = min(Scene::n_cells_y - (scene_idx_y + tile_width), tile_padding);
+        uint8_t tile_padding_top = min(scene_idx_x, tile_padding);
+        uint8_t tile_padding_bottom = min(Scene::n_cells_x - (scene_idx_x + tile_height), tile_padding);
+        tile_width += tile_padding_left + tile_padding_right;
+        tile_height += tile_padding_top + tile_padding_bottom;
 
+        // Update the scene idx based on the expansion
+        scene_idx_y -= tile_padding_left;
+        scene_idx_x -= tile_padding_top;
+        uint32_t scene_idx = scene_idx_y * Scene::n_cells_x + scene_idx_x;
+
+        // Global buffers (moved to the tile location)
+        float *global_u0 = u0 + scene_idx;
+        float *global_u1 = u1 + scene_idx;
         // Local buffers
         float *local_u0 = sram;
         float *local_u1 = sram + tile_height * tile_width;
@@ -359,40 +322,40 @@ __global__ void wave_gpu_shmem_multistep(
         );
 
         // Limit steps so we don’t exceed shrink
-        uint8_t max_shrink = max(
-            max(left_shrink_amt, right_shrink_amt),
-            max(top_shrink_amt, bottom_shrink_amt)
+        uint8_t max_padding = max(
+            max(tile_padding_left, tile_padding_right),
+            max(tile_padding_top, tile_padding_bottom)
         );
-        uint32_t actual_tf_step = ti_step + min(tf_step - ti_step, max_shrink);
+        uint32_t actual_tf_step = ti_step + min(tf_step - ti_step, max_padding);
 
         // Iterate over the time steps
-        for (uint32_t idx_step = ti_step; idx_step < actual_tf_step; ++idx_step) {
+        for (uint32_t time_step_idx = ti_step; time_step_idx < actual_tf_step; ++time_step_idx) {
             // Shrink tile width
-            shrink_axis(tile_width, left_shrink_amt, right_shrink_amt,
+            shrink_axis(tile_width, tile_padding_left, tile_padding_right,
                 global_u0, global_u1, global_buffer_height,
                 local_u0, local_u1, local_buffer_height
             );
             // Shrink tile height
-            shrink_axis(tile_height, top_shrink_amt, bottom_shrink_amt,
+            shrink_axis(tile_height, tile_padding_top, tile_padding_bottom,
                 global_u0, global_u1, 1, 
                 local_u0, local_u1, 1
             );
 
             // Calculate t
-            float t = t0 + idx_step * Scene::dt;
+            float t = t0 + time_step_idx * Scene::dt;
 
             // Flatten the 2D iteration space into 1D and stride tot_threads pixels each iteration
-            for (uint32_t tile_idx = threadIdx.x; tile_idx < tile_height * tile_width; tile_idx += blockDim.x) {
-                // Get tile idx for tile offset
-                uint32_t tile_idx_y = tile_idx / tile_height;
-                uint32_t tile_idx_x = tile_idx % tile_height;
+            for (uint32_t pixel_idx = threadIdx.x; pixel_idx < tile_height * tile_width; pixel_idx += blockDim.x) {
+                // Get pixel idx for offset
+                uint32_t pixel_idx_y = pixel_idx / tile_height;
+                uint32_t pixel_idx_x = pixel_idx % tile_height;
                 // Get global idx for calculation
                 uint32_t global_idx = global_u0 - u0;
-                global_idx += tile_idx_y * global_buffer_height + tile_idx_x;
+                global_idx += pixel_idx_y * global_buffer_height + pixel_idx_x;
                 uint32_t global_idx_y = global_idx / global_buffer_height;
                 uint32_t global_idx_x = global_idx % global_buffer_height;
                 // Get local idx for memory
-                uint32_t local_idx = tile_idx_y * local_buffer_height + tile_idx_x;
+                uint32_t local_idx = pixel_idx_y * local_buffer_height + pixel_idx_x;
                 // Wave math
                 wave<Scene>(global_idx_y, global_idx_x, t,
                     local_u0, local_u1,
@@ -469,18 +432,18 @@ std::pair<float *, float *> wave_gpu_shmem(
     // (2) (tw + 2t) * (tw + 2t) <= 12500
     // (3) tw <= sqrt(6250) - 2t
     // (4) To maximize SRAM we will use tw = sqrt(6250) - 2t
-    uint16_t subtile_width = min(
+    uint16_t tile_width = min(
         sqrt(Scene::n_cells_y) * sqrt(Scene::n_cells_x) / sqrt(48),
         sqrt(6250) - 2 * time_steps
     );
-    uint16_t subtile_height = subtile_width;
+    uint16_t tile_height = tile_width;
 
-    // Subtile dimensions
-    uint32_t subtiles_per_row = Scene::n_cells_y / subtile_width;
-    uint32_t subtiles_per_col = Scene::n_cells_x / subtile_height;
-    if (subtiles_per_row * subtiles_per_col < 48) {
+    // Tile dimensions
+    uint32_t tiles_per_row = Scene::n_cells_y / tile_width;
+    uint32_t tiles_per_col = Scene::n_cells_x / tile_height;
+    if (tiles_per_row * tiles_per_col < 48) {
         // Add the extra tiles to the height
-        subtiles_per_col += (48 - subtiles_per_row * subtiles_per_col) / subtiles_per_row;
+        tiles_per_col += (48 - tiles_per_row * tiles_per_col) / tiles_per_row;
     }
 
     for (uint32_t idx_step = 0; idx_step < n_steps; idx_step += time_steps) {
@@ -497,7 +460,7 @@ std::pair<float *, float *> wave_gpu_shmem(
         ));
 
         // Launch our kernel
-        wave_gpu_shmem_multistep<Scene><<<48, 32 * 32, shmem_size_bytes>>>(t0, ti_step, tf_step, u0, u1, extra0, extra1, subtiles_per_col, subtiles_per_row);
+        wave_gpu_shmem_multistep<Scene><<<48, 32 * 32, shmem_size_bytes>>>(t0, ti_step, tf_step, u0, u1, extra0, extra1, tiles_per_col, tiles_per_row);
 
         // Treat the multi step kernel as one step so u0 will now contain the most recent
         std::swap(u0, extra0);
