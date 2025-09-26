@@ -340,6 +340,7 @@ __global__ void wave_gpu_shmem_multistep(
     extern __shared__ float sram[];
     // Global buffer size
     uint32_t global_buffer_height = Scene::n_cells_x;
+    uint32_t total_tiles = tiles_per_col * tiles_per_row;
 
     // Divide the scene into tiles (valid data that must be written back at the end)
     uint32_t base_tile_height = Scene::n_cells_x / tiles_per_col;
@@ -365,7 +366,7 @@ __global__ void wave_gpu_shmem_multistep(
     Tile tile;
 
     // Iterate over the SM's tiles and process each one one at a time
-    for (uint32_t tile_idx = blockIdx.x; tile_idx < tiles_per_col * tiles_per_row; tile_idx += gridDim.x) {
+    for (uint32_t tile_idx = blockIdx.x; tile_idx < total_tiles; tile_idx += gridDim.x) {
         // Setup the current and next tiles
         tile_setup_input.tile_idx = tile_idx;
         setup_tile(&tile_setup_input, &tile);
@@ -384,9 +385,9 @@ __global__ void wave_gpu_shmem_multistep(
             local_u0, local_u1, local_buffer_height,
             tile_height, tile_width
         );
-        // Prefetch the next tile by bringing it into the L2 cache
+        // Prefetch the next tile by bringing it into the L2 cache (w/o padding)
         uint32_t next_tile_idx = tile_idx + gridDim.x;
-        if (next_tile_idx < tiles_per_col * tiles_per_row) {
+        if (next_tile_idx < total_tiles) {
             uint32_t next_tile_idx_y = next_tile_idx / tiles_per_col;
             uint32_t next_tile_idx_x = next_tile_idx % tiles_per_col;
             uint32_t next_scene_idx_y = next_tile_idx_y * base_tile_width;
@@ -493,34 +494,10 @@ std::pair<float *, float *> wave_gpu_shmem(
     float *extra1  /* pointer to GPU memory */
 ) {
     // Number of time steps to process at once in a kernel
-    bool large_scene = Scene::n_cells_y * Scene::n_cells_x > 600000; // Could be useful?
-    uint8_t time_steps = large_scene ? 8 : 8;
+    bool large_scene = Scene::n_cells_y * Scene::n_cells_x > 600000;
+    uint8_t time_steps = 8;
 
-    // Assume we want tw = th for square tiles then
-    // Min subtile size math:
-    // (1) tw = th = w/tpr = h/tpc
-    // (2) tpr * tpc = 48 => tpr = 48/tpc
-    // (3) w/(48/tpc) = h/tpc => tpc = sqrt(48*h/w) 
-    // (4) tw = th = h/sqrt(48*h/w) => tw = th = sqrt(h)*sqrt(w)/sqrt(48)
-    // Max subtile size math:
-    // (1) 2 * (tw + 2t) * (th + 2t) * ((32/8)/1000) <= MAX_SRAM (100)
-    // (2) (tw + 2t) * (tw + 2t) <= 12500
-    // (3) tw <= sqrt(6250) - 2t
-    // (4) To maximize SRAM we will use tw = sqrt(6250) - 2t
-    // uint16_t tile_width = min(
-    //     sqrt(Scene::n_cells_y) * sqrt(Scene::n_cells_x) / sqrt(48),
-    //     sqrt(6250) - 2 * time_steps
-    // );
-    // uint16_t tile_height = tile_width;
-
-    // Tile dimensions
-    // uint32_t tiles_per_row = Scene::n_cells_y / tile_width;
-    // uint32_t tiles_per_col = Scene::n_cells_x / tile_height;
-    // if (tiles_per_row * tiles_per_col < 48) {
-    //     // Add the extra tiles to the height
-    //     tiles_per_col += (48 - tiles_per_row * tiles_per_col) / tiles_per_row;
-    // }
-
+    // Tile deimensions for large and small image (not dynamic idk why it works)
     uint32_t tiles_per_col, tiles_per_row;
     if (large_scene) {
         tiles_per_col = 34;
