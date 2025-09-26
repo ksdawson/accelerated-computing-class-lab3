@@ -299,9 +299,9 @@ struct Tile {
     uint8_t tile_padding_bottom;
 };
 
-__device__ void setup_tile(TileInput *tile_input, Tile *tile) {
+__device__ void setup_tile(TileInput *tile_setup_input, Tile *tile) {
     // Input
-    auto [scene_height, scene_width, tile_idx, tiles_per_col, tiles_per_row, base_tile_height, base_tile_width, extra_tile_height, extra_tile_width, tile_padding] = *tile_input;
+    auto [scene_height, scene_width, tile_idx, tiles_per_col, tiles_per_row, base_tile_height, base_tile_width, extra_tile_height, extra_tile_width, tile_padding] = *tile_setup_input;
     
     // Get tile idx
     uint32_t tile_idx_y = tile_idx / tiles_per_col;
@@ -349,7 +349,8 @@ __global__ void wave_gpu_shmem_multistep(
     uint32_t extra_tile_width = base_tile_width + Scene::n_cells_y % tiles_per_row;
     uint8_t tile_padding = tf_step - ti_step;
 
-    TileInput tile_input = {
+    // Tile structs
+    TileInput tile_setup_input = {
         Scene::n_cells_x,
         Scene::n_cells_y,
         0,
@@ -366,8 +367,8 @@ __global__ void wave_gpu_shmem_multistep(
     // Iterate over the SM's tiles and process each one one at a time
     for (uint32_t tile_idx = blockIdx.x; tile_idx < tiles_per_col * tiles_per_row; tile_idx += gridDim.x) {
         // Setup the current and next tiles
-        tile_input.tile_idx = tile_idx;
-        setup_tile(&tile_input, &tile);
+        tile_setup_input.tile_idx = tile_idx;
+        setup_tile(&tile_setup_input, &tile);
         auto [scene_idx, tile_height, tile_width, tile_padding_left, tile_padding_right, tile_padding_top, tile_padding_bottom] = tile;
 
         // Global buffers (moved to the tile location)
@@ -506,18 +507,27 @@ std::pair<float *, float *> wave_gpu_shmem(
     // (2) (tw + 2t) * (tw + 2t) <= 12500
     // (3) tw <= sqrt(6250) - 2t
     // (4) To maximize SRAM we will use tw = sqrt(6250) - 2t
-    uint16_t tile_width = min(
-        sqrt(Scene::n_cells_y) * sqrt(Scene::n_cells_x) / sqrt(48),
-        sqrt(6250) - 2 * time_steps
-    );
-    uint16_t tile_height = tile_width;
+    // uint16_t tile_width = min(
+    //     sqrt(Scene::n_cells_y) * sqrt(Scene::n_cells_x) / sqrt(48),
+    //     sqrt(6250) - 2 * time_steps
+    // );
+    // uint16_t tile_height = tile_width;
 
     // Tile dimensions
-    uint32_t tiles_per_row = Scene::n_cells_y / tile_width;
-    uint32_t tiles_per_col = Scene::n_cells_x / tile_height;
-    if (tiles_per_row * tiles_per_col < 48) {
-        // Add the extra tiles to the height
-        tiles_per_col += (48 - tiles_per_row * tiles_per_col) / tiles_per_row;
+    // uint32_t tiles_per_row = Scene::n_cells_y / tile_width;
+    // uint32_t tiles_per_col = Scene::n_cells_x / tile_height;
+    // if (tiles_per_row * tiles_per_col < 48) {
+    //     // Add the extra tiles to the height
+    //     tiles_per_col += (48 - tiles_per_row * tiles_per_col) / tiles_per_row;
+    // }
+
+    uint32_t tiles_per_col, tiles_per_row;
+    if (large_scene) {
+        tiles_per_col = 34;
+        tiles_per_row = 34;
+    } else {
+        tiles_per_col = 8;
+        tiles_per_row = 6;
     }
 
     for (uint32_t idx_step = 0; idx_step < n_steps; idx_step += time_steps) {
@@ -526,7 +536,7 @@ std::pair<float *, float *> wave_gpu_shmem(
         uint32_t tf_step = ti_step + min(n_steps - idx_step, time_steps);
 
         // Setup the block SRAM
-        int shmem_size_bytes = 100 * 1000; // Max 100 KB per block
+        int shmem_size_bytes = 100 * 1013; // Max 100 KB per block
         CUDA_CHECK(cudaFuncSetAttribute(
             wave_gpu_shmem_multistep<Scene>,
             cudaFuncAttributeMaxDynamicSharedMemorySize,
