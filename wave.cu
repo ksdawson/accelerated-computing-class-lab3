@@ -344,16 +344,16 @@ __global__ void wave_gpu_shmem_multistep(
             // Calculate t and global idx for calculation
             float t = t0 + time_step_idx * Scene::dt;
             uint32_t global_idx = global_u0 - u0;
-            uint32_t global_idx_y = global_idx / global_buffer_height;
-            uint32_t global_idx_x = global_idx % global_buffer_height;
+            uint16_t global_idx_y = global_idx / global_buffer_height;
+            uint16_t global_idx_x = global_idx % global_buffer_height;
 
             // Flatten the 2D iteration space into 1D and stride tot_threads pixels each iteration
-            for (uint32_t pixel_idx = threadIdx.x; pixel_idx < tile_height * tile_width; pixel_idx += blockDim.x) {
+            for (uint16_t pixel_idx = threadIdx.x; pixel_idx < tile_height * tile_width; pixel_idx += blockDim.x) {
                 // Get pixel idx for buffer offsets
-                uint32_t pixel_idx_y = pixel_idx / tile_height;
-                uint32_t pixel_idx_x = pixel_idx % tile_height;
+                uint16_t pixel_idx_y = pixel_idx / tile_height;
+                uint16_t pixel_idx_x = pixel_idx % tile_height;
                 // Get local idx for memory
-                uint32_t local_idx = pixel_idx_y * local_buffer_height + pixel_idx_x;
+                uint16_t local_idx = pixel_idx_y * local_buffer_height + pixel_idx_x;
                 // Wave math
                 wave<Scene>(global_idx_y + pixel_idx_y, global_idx_x + pixel_idx_x, t,
                     local_u0, local_u1,
