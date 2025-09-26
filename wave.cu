@@ -104,7 +104,7 @@ std::pair<float *, float *> wave_cpu(float t0, int32_t n_steps, float *u0, float
 // Helper to do wave math
 template <typename Scene>
 __device__ void wave(uint32_t idx_y, uint32_t idx_x, float t, // Scene params
-    float *u0, float *u1, uint64_t memory_idx, uint32_t memory_height // Memory params
+    float *u0, float *u1, uint32_t memory_idx, uint32_t memory_height // Memory params
 ) {
     // Scene parameters
     constexpr int32_t n_cells_x = Scene::n_cells_x;
@@ -163,11 +163,11 @@ __global__ void wave_gpu_naive_step(
     int thread_index = blockIdx.x * blockDim.x + threadIdx.x;
 
     // Flatten the 2D iteration space into 1D and stride tot_threads pixels each iteration
-    for (uint64_t idx = thread_index * ilp_size; idx < n_cells_y * n_cells_x; idx += tot_threads * ilp_size) {
+    for (uint32_t idx = thread_index * ilp_size; idx < n_cells_y * n_cells_x; idx += tot_threads * ilp_size) {
         #pragma unroll
         for (uint8_t i = 0; i < ilp_size; ++i) {
             // Use 32x1 vectors
-            uint64_t ilp_idx = idx + i;
+            uint32_t ilp_idx = idx + i;
             uint32_t idx_y = ilp_idx / n_cells_x;
             uint32_t idx_x = ilp_idx % n_cells_x;
             // Wave math
@@ -220,7 +220,7 @@ __device__ void copy_mem(
     uint32_t local_height, uint32_t local_width
 ) {
     // Copy data from one buffer to another
-    for (uint64_t local_idx = threadIdx.x; local_idx < local_height * local_width; local_idx += blockDim.x) {
+    for (uint32_t local_idx = threadIdx.x; local_idx < local_height * local_width; local_idx += blockDim.x) {
         // Get local idx for local offset
         uint32_t local_idx_y = local_idx / local_height;
         uint32_t local_idx_x = local_idx % local_height;
@@ -234,28 +234,6 @@ __device__ void copy_mem(
     }
     // Wait for all the memory to be copied
     __syncthreads();
-}
-__device__ void load_shmem(
-    float *global_u0, float *global_u1, uint32_t global_buffer_height, // Main memory buffer params
-    float *local_u0, float *local_u1, uint32_t local_buffer_height, // SRAM buffer params
-    uint32_t tile_height, uint32_t tile_width // Tile params
-) {
-    // Load data from main memory to SRAM
-    copy_mem(global_u0, global_u1, global_buffer_height,
-        local_u0, local_u1, local_buffer_height,
-        tile_height, tile_width
-    );
-}
-__device__ void store_shmem(
-    float *global_u0, float *global_u1, uint32_t global_buffer_height, // Main memory buffer params
-    float *local_u0, float *local_u1, uint32_t local_buffer_height, // SRAM buffer params
-    uint32_t tile_height, uint32_t tile_width // Tile params
-) {
-    // Store data to main memory from SRAM
-    copy_mem(local_u0, local_u1, local_buffer_height,
-        global_u0, global_u1, global_buffer_height,
-        tile_height, tile_width
-    );
 }
 
 // Helper to setup the tile
@@ -375,7 +353,7 @@ __global__ void wave_gpu_shmem_multistep(
         uint32_t local_buffer_height = tile_height;
         
         // Load data from main (u0, u1) to local memory
-        load_shmem(global_u0, global_u1, global_buffer_height,
+        copy_mem(global_u0, global_u1, global_buffer_height,
             local_u0, local_u1, local_buffer_height,
             tile_height, tile_width
         );
@@ -404,17 +382,17 @@ __global__ void wave_gpu_shmem_multistep(
             float t = t0 + idx_step * Scene::dt;
 
             // Flatten the 2D iteration space into 1D and stride tot_threads pixels each iteration
-            for (uint64_t tile_idx = threadIdx.x; tile_idx < tile_height * tile_width; tile_idx += blockDim.x) {
+            for (uint32_t tile_idx = threadIdx.x; tile_idx < tile_height * tile_width; tile_idx += blockDim.x) {
                 // Get tile idx for tile offset
                 uint32_t tile_idx_y = tile_idx / tile_height;
                 uint32_t tile_idx_x = tile_idx % tile_height;
                 // Get global idx for calculation
-                uint64_t global_idx = global_u0 - u0;
+                uint32_t global_idx = global_u0 - u0;
                 global_idx += tile_idx_y * global_buffer_height + tile_idx_x;
                 uint32_t global_idx_y = global_idx / global_buffer_height;
                 uint32_t global_idx_x = global_idx % global_buffer_height;
                 // Get local idx for memory
-                uint64_t local_idx = tile_idx_y * local_buffer_height + tile_idx_x;
+                uint32_t local_idx = tile_idx_y * local_buffer_height + tile_idx_x;
                 // Wave math
                 wave<Scene>(global_idx_y, global_idx_x, t,
                     local_u0, local_u1,
@@ -436,8 +414,8 @@ __global__ void wave_gpu_shmem_multistep(
         float *extra_global_u0 = (global_u0 - u0) + extra0;
         float *extra_global_u1 = (global_u1 - u1) + extra1;
         // Store data from local memory to main memory (extra0, extra1)
-        store_shmem(extra_global_u0, extra_global_u1, global_buffer_height,
-            local_u0, local_u1, local_buffer_height,
+        copy_mem(local_u0, local_u1, local_buffer_height,
+            extra_global_u0, extra_global_u1, global_buffer_height,
             tile_height, tile_width
         );
     }
@@ -492,8 +470,8 @@ std::pair<float *, float *> wave_gpu_shmem(
     // (3) tw <= sqrt(6250) - 2t
     // (4) To maximize SRAM we will use tw = sqrt(6250) - 2t
     uint16_t subtile_width = min(
-        (uint64_t)(sqrt(Scene::n_cells_y) * sqrt(Scene::n_cells_x) / sqrt(48)),
-        (uint64_t)(sqrt(6250) - 2 * time_steps)
+        sqrt(Scene::n_cells_y) * sqrt(Scene::n_cells_x) / sqrt(48),
+        sqrt(6250) - 2 * time_steps
     );
     uint16_t subtile_height = subtile_width;
 
