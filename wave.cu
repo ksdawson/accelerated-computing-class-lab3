@@ -277,6 +277,59 @@ __device__ void shrink_axis(uint32_t &tile_size, uint8_t &front_shrink, uint8_t 
     }
 }
 
+struct TileInput {
+    uint32_t scene_height;
+    uint32_t scene_width;
+    uint32_t tile_idx;
+    uint32_t tiles_per_col;
+    uint32_t tiles_per_row;
+    uint32_t base_tile_height;
+    uint32_t base_tile_width;
+    uint32_t extra_tile_height;
+    uint32_t extra_tile_width;
+    uint8_t tile_padding;
+};
+struct Tile {
+    uint32_t scene_idx;
+    uint32_t tile_height;
+    uint32_t tile_width;
+    uint8_t tile_padding_left;
+    uint8_t tile_padding_right;
+    uint8_t tile_padding_top;
+    uint8_t tile_padding_bottom;
+};
+
+__device__ void setup_tile(TileInput *tile_input, Tile *tile) {
+    // Input
+    auto [scene_height, scene_width, tile_idx, tiles_per_col, tiles_per_row, base_tile_height, base_tile_width, extra_tile_height, extra_tile_width, tile_padding] = *tile_input;
+    
+    // Get tile idx
+    uint32_t tile_idx_y = tile_idx / tiles_per_col;
+    uint32_t tile_idx_x = tile_idx % tiles_per_col;
+    // Calculate starting scene idx of the tile
+    uint32_t scene_idx_y = tile_idx_y * base_tile_width;
+    uint32_t scene_idx_x = tile_idx_x * base_tile_height;
+
+    // Tile size without time step expansion (add extra to edges for simplicity)
+    uint32_t tile_height = (tile_idx_x == tiles_per_col - 1) ? extra_tile_height : base_tile_height;
+    uint32_t tile_width = (tile_idx_y == tiles_per_row - 1) ? extra_tile_width : base_tile_width;
+    // Expand the tile by the number of time steps in each direction (overlap for invalid data)
+    uint8_t tile_padding_left = min(scene_idx_y, tile_padding); // Cap expansion to the edges
+    uint8_t tile_padding_right = min(scene_width - (scene_idx_y + tile_width), tile_padding);
+    uint8_t tile_padding_top = min(scene_idx_x, tile_padding);
+    uint8_t tile_padding_bottom = min(scene_height - (scene_idx_x + tile_height), tile_padding);
+    tile_width += tile_padding_left + tile_padding_right;
+    tile_height += tile_padding_top + tile_padding_bottom;
+
+    // Update the scene idx based on the expansion
+    scene_idx_y -= tile_padding_left;
+    scene_idx_x -= tile_padding_top;
+    uint32_t scene_idx = scene_idx_y * scene_height + scene_idx_x;
+
+    // Output
+    *tile = {scene_idx, tile_height, tile_width, tile_padding_left, tile_padding_right, tile_padding_top, tile_padding_bottom};
+}
+
 template <typename Scene>
 __global__ void wave_gpu_shmem_multistep(
     float t0, uint32_t ti_step, uint32_t tf_step, // Time params
@@ -294,33 +347,28 @@ __global__ void wave_gpu_shmem_multistep(
     // Handle scenes not divisible by the number of tiles
     uint32_t extra_tile_height = base_tile_height + Scene::n_cells_x % tiles_per_col;
     uint32_t extra_tile_width = base_tile_width + Scene::n_cells_y % tiles_per_row;
+    uint8_t tile_padding = tf_step - ti_step;
+
+    TileInput tile_input = {
+        Scene::n_cells_x,
+        Scene::n_cells_y,
+        0,
+        tiles_per_col,
+        tiles_per_row,
+        base_tile_height,
+        base_tile_width,
+        extra_tile_height,
+        extra_tile_width,
+        tile_padding,
+    };
+    Tile tile;
 
     // Iterate over the SM's tiles and process each one one at a time
     for (uint32_t tile_idx = blockIdx.x; tile_idx < tiles_per_col * tiles_per_row; tile_idx += gridDim.x) {
-        // Get tile idx
-        uint32_t tile_idx_y = tile_idx / tiles_per_col;
-        uint32_t tile_idx_x = tile_idx % tiles_per_col;
-        // Calculate starting scene idx of the tile
-        uint32_t scene_idx_y = tile_idx_y * base_tile_width;
-        uint32_t scene_idx_x = tile_idx_x * base_tile_height;
-
-        // Tile size without time step expansion (add extra to edges for simplicity)
-        uint32_t tile_height = (tile_idx_x == tiles_per_col - 1) ? extra_tile_height : base_tile_height;
-        uint32_t tile_width = (tile_idx_y == tiles_per_row - 1) ? extra_tile_width : base_tile_width;
-        // Expand the tile by the number of time steps in each direction (overlap for invalid data)
-        uint8_t tile_padding = tf_step - ti_step;
-        // Cap expansion to the edges
-        uint8_t tile_padding_left = min(scene_idx_y, tile_padding);
-        uint8_t tile_padding_right = min(Scene::n_cells_y - (scene_idx_y + tile_width), tile_padding);
-        uint8_t tile_padding_top = min(scene_idx_x, tile_padding);
-        uint8_t tile_padding_bottom = min(Scene::n_cells_x - (scene_idx_x + tile_height), tile_padding);
-        tile_width += tile_padding_left + tile_padding_right;
-        tile_height += tile_padding_top + tile_padding_bottom;
-
-        // Update the scene idx based on the expansion
-        scene_idx_y -= tile_padding_left;
-        scene_idx_x -= tile_padding_top;
-        uint32_t scene_idx = scene_idx_y * Scene::n_cells_x + scene_idx_x;
+        // Setup the current and next tiles
+        tile_input.tile_idx = tile_idx;
+        setup_tile(&tile_input, &tile);
+        auto [scene_idx, tile_height, tile_width, tile_padding_left, tile_padding_right, tile_padding_top, tile_padding_bottom] = tile;
 
         // Global buffers (moved to the tile location)
         float *global_u0 = u0 + scene_idx;
