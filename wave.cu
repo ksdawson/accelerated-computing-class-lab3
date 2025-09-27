@@ -494,18 +494,21 @@ std::pair<float *, float *> wave_gpu_shmem(
     float *extra1  /* pointer to GPU memory */
 ) {
     // Number of time steps to process at once in a kernel
-    bool large_scene = Scene::n_cells_y * Scene::n_cells_x > 600000;
     uint8_t time_steps = 8;
 
-    // Tile deimensions for large and small image (not dynamic idk why it works)
-    uint32_t tiles_per_col, tiles_per_row;
-    if (large_scene) {
-        tiles_per_col = 34;
-        tiles_per_row = 34;
-    } else {
-        tiles_per_col = 8;
-        tiles_per_row = 6;
-    }
+    // max tile size := sqrt((100*1024)/(2*4)) ~= 113
+    uint8_t max_tile_size = 113 - 2 * time_steps;
+    // tile dimensions
+    uint8_t tiles_per_col = Scene::n_cells_x / max_tile_size;
+    uint8_t tiles_per_row = Scene::n_cells_y / max_tile_size;
+    // handle overflow
+    uint8_t extra_per_col = Scene::n_cells_x % max_tile_size;
+    tiles_per_col += extra_per_col == 0 ? 0 : extra_per_col / tiles_per_col + 1;
+    uint8_t extra_per_row = Scene::n_cells_y % max_tile_size;
+    tiles_per_row += extra_per_row == 0 ? 0 : extra_per_row / tiles_per_row + 1;
+    // ensure at least one tile per SM
+    tiles_per_col = max(tiles_per_col, 8);
+    tiles_per_row = max(tiles_per_row, 6);
 
     for (uint32_t idx_step = 0; idx_step < n_steps; idx_step += time_steps) {
         // Compute starting and ending time step
