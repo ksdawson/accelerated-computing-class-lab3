@@ -239,7 +239,8 @@ __device__ void warmup_cache(
     float *src_u0, float *src_u1, uint32_t src_buffer_height,
     uint32_t local_height, uint32_t local_width
 ) {
-    for (uint32_t local_idx = threadIdx.x; local_idx < local_height * local_width; local_idx += blockDim.x) {
+    uint8_t stride = 32; // 128b cache line size -> 32 floats
+    for (uint32_t local_idx = threadIdx.x * stride; local_idx < local_height * local_width; local_idx += blockDim.x * stride) {
         // Get local idx for local offset
         uint32_t local_idx_y = local_idx / local_height;
         uint32_t local_idx_x = local_idx % local_height;
@@ -394,8 +395,8 @@ __global__ void wave_gpu_shmem_multistep(
             uint32_t next_scene_idx_x = next_tile_idx_x * base_tile_height;
             uint32_t next_scene_idx = next_scene_idx_y * Scene::n_cells_x + next_scene_idx_x;
             warmup_cache(
-                u0 + next_scene_idx, u1 + next_scene_idx, global_buffer_height,
-                base_tile_height, base_tile_width
+                    u0 + next_scene_idx, u1 + next_scene_idx, global_buffer_height,
+                    base_tile_height, base_tile_width
             );
         }
 
